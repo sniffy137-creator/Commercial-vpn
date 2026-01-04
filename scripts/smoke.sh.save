@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -----------------------------
+# Config (можно переопределять через env)
+# -----------------------------
+API_BASE="${API_BASE:-http://127.0.0.1:8000}"
+EMAIL="${EMAIL:-newadmin@example.com}"
+PASSWORD="${PASSWORD:-NewPass123!NewPass123!}"
+
+# Postgres in docker (как у тебя)
+PG_CONTAINER="${PG_CONTAINER:-vpn-postgres}"
+PG_USER="${PG_USER:-vpn}"
+PG_DB="${PG_DB:-vpn}"
+
+# Optional: if your .env needed for something (обычно нет, но оставим)
+ENV_FILE="${ENV_FILE:-.env}"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+say() { echo -e "\n\033[1;36m==>\033[0m $*"; }
+ok()  { echo -e "\033[1;32mOK\033[0m  $*"; }
+fail(){ echo -e "\033[1;31mFAIL\033[0m $*" >&2; exit 1; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "Command not found: $1"
+}
+
+http_code() {
+  # usage: http_code <curl args...>
+  curl -s -o /tmp/smoke_body.$$ -w "%{http_code}" "$@"
+}
+
+json_get() {
+  # usage: json_get <key>
+  python - "$1" <<'PY'
+import sys, json
+key = sys.argv[1]
+data = json.load(sys.stdin)
+print(data[key])
+PY
+}
+
+# -----------------------------
+# Preflight
+# -----------------------------
+need_cmd curl
+need_cmd python
+need_cmd docker
+
+# Load .env if exists (не обязателен, но пусть будет)
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+say "Preflight"
+ok "API_BASE=$API_BASE"
+ok "EMAIL=$EMAIL"
+ok "PG_CONTAINER=$PG_CONTAINER PG_USER=$PG_USER PG_DB=$PG_DB"
+
+# -----------------------------
+# 1) Health
+# -----------------------------
+say "Health check"
+CODE=$(http_code "$API_BASE/health")
+BODY=$(cat /tmp/smoke_body.$$)
+rm -f /tmp/smoke_body.$$
+
+[[ "$CODE" == "200" ]] || fail "/health expected 200, got $CODE: $BODY"
+echo "$BODY" | grep -q '"status"' || fail "/health body unexpected: $BODY"
+ok "/health returned 200"
+
+# -----------------------------
+# 2) Register (idempotent-ish)
+# -----------------------------
+say "Register (if already exists, should still be fine)"
+CODE=$(http_code -X POST "$API_BASE/auth/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" )
+BODY=$(cat /tmp/smoke_body.$$)
+rm -f /tmp/smoke_body.$$
+
+if [[ "$CODE" == "200" || "$CODE" == "201" ]]; then
+  ok "Registered user (code=$CODE)"
+else
+  # если у тебя register отдаёт 400/409 при существующем юзере — не считаем фаталом
+  ok "Register not applied (code=$CODE) - continuing (likely already exists)"
+fi
+
+# -----------------------------
+# 3) Login -> TOKEN
+# -----------------------------
+say "Login (user token)"
+RESP=$(curl -s -X POST "$API_BASE/auth/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=$EMAIL&password=$PASSWORD")
+
+TOKEN=$(echo "$RESP" | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+[[ -n "$TOKEN" ]] || fail "Empty TOKEN"
+ok "Got TOKEN"
+
+# -----------------------------
+# 4) USER /servers flow
+# -----------------------------
+say "USER: GET /servers (should be [] or list)"
+RESP=$(curl -s "$API_BASE/servers" -H "Authorization: Bearer $TOKEN")
+ok "List servers returned"
+
+say "USER: POST /servers (create)"
+CREATED=$(curl -s -X POST "$API_BASE/servers" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"Smoke-Test-1",
+    "host":"1.2.3.4",
+    "port":51820,
+    "country":"NL",
+    "is_active": true,
+    "notes":"first"
+  }')
+
+SERVER_ID=$(echo "$CREATED" | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
+[[ -n "$SERVER_ID" ]] || fail "SERVER_ID empty. Response: $CREATED"
+ok "Created server id=$SERVER_ID"
+
+say "USER: GET /servers/$SERVER_ID"
+CODE=$(http_code "$API_BASE/servers/$SERVER_ID" -H "Authorization: Bearer $TOKEN")
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "200" ]] || fail "GET server expected 200, got $CODE: $BODY"
+ok "Fetched server"
+
+say "USER: PATCH /servers/$SERVER_ID"
+CODE=$(http_code -X PATCH "$API_BASE/servers/$SERVER_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"notes":"updated note"}')
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "200" ]] || fail "PATCH expected 200, got $CODE: $BODY"
+ok "Updated server"
+
+say "USER: UNIQUE check (expect 409)"
+CODE=$(http_code -X POST "$API_BASE/servers" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"Smoke-Dup",
+    "host":"1.2.3.4",
+    "port":51820,
+    "country":"NL",
+    "is_active": true,
+    "notes":"dup"
+  }')
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "409" ]] || fail "Expected 409 on duplicate, got $CODE: $BODY"
+ok "Duplicate returned 409"
+
+say "USER: DELETE /servers/$SERVER_ID (expect 204)"
+CODE=$(http_code -X DELETE "$API_BASE/servers/$SERVER_ID" \
+  -H "Authorization: Bearer $TOKEN")
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "204" ]] || fail "DELETE expected 204, got $CODE: $BODY"
+ok "Deleted server (soft delete)"
+
+say "USER: GET /servers should not include deleted"
+RESP=$(curl -s "$API_BASE/servers" -H "Authorization: Bearer $TOKEN")
+ok "List after delete returned"
+
+# -----------------------------
+# 5) Promote to admin in DB
+# -----------------------------
+say "DB: Promote user to admin"
+docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" \
+  -c "UPDATE users SET role='admin' WHERE email='${EMAIL}';" >/dev/null
+ok "Role set to admin (DB)"
+
+# -----------------------------
+# 6) Login again -> TOKEN_ADMIN
+# -----------------------------
+say "Login again (admin token)"
+RESP=$(curl -s -X POST "$API_BASE/auth/login" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=$EMAIL&password=$PASSWORD")
+
+TOKEN_ADMIN=$(echo "$RESP" | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+[[ -n "$TOKEN_ADMIN" ]] || fail "Empty TOKEN_ADMIN"
+ok "Got TOKEN_ADMIN"
+
+# -----------------------------
+# 7) ADMIN endpoints
+# -----------------------------
+say "ADMIN: GET /admin/users (expect 200)"
+CODE=$(http_code "$API_BASE/admin/users" -H "Authorization: Bearer $TOKEN_ADMIN")
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "200" ]] || fail "Admin users expected 200, got $CODE: $BODY"
+ok "Admin users ok"
+
+say "ADMIN: GET /admin/servers (expect 200)"
+CODE=$(http_code "$API_BASE/admin/servers" -H "Authorization: Bearer $TOKEN_ADMIN")
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "200" ]] || fail "Admin servers expected 200, got $CODE: $BODY"
+ok "Admin servers ok"
+
+say "ADMIN: POST /admin/servers/$SERVER_ID/restore (expect 200)"
+CODE=$(http_code -X POST "$API_BASE/admin/servers/$SERVER_ID/restore" \
+  -H "Authorization: Bearer $TOKEN_ADMIN")
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "200" ]] || fail "Admin restore expected 200, got $CODE: $BODY"
+ok "Admin restored server"
+
+say "ADMIN: POST /admin/servers/$SERVER_ID/delete (expect 200)"
+CODE=$(http_code -X POST "$API_BASE/admin/servers/$SERVER_ID/delete" \
+  -H "Authorization: Bearer $TOKEN_ADMIN")
+BODY=$(cat /tmp/smoke_body.$$); rm -f /tmp/smoke_body.$$
+[[ "$CODE" == "200" ]] || fail "Admin delete expected 200, got $CODE: $BODY"
+ok "Admin deleted server"
+
+# -----------------------------
+# 8) Audit check in DB (print last few rows)
+# -----------------------------
+say "DB: Audit snapshot (servers last 5)"
+docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -c "
+SELECT
+  id, owner_id, host, port,
+  deleted_at,
+  created_by, updated_by, deleted_by, restored_by,
+  created_at, updated_at
+FROM servers
+ORDER BY id DESC
+LIMIT 5;
+"
+
+
+ok "SMOKE TEST COMPLETED"
