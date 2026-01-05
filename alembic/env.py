@@ -1,41 +1,31 @@
+from __future__ import annotations
+
+import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 
-from app.core.config import settings
-from app.db.base import Base  # Base.metadata
-from app.db.models import User, Server  # noqa: F401  (регистрация моделей в metadata)
+# ВАЖНО: этот импорт должен существовать
+from app.db.base import Base
 
-# Alembic Config object
 config = context.config
 
-# Настройка логирования из alembic.ini
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Metadata для autogenerate
 target_metadata = Base.metadata
 
 
-def _get_sqlalchemy_url() -> str:
-    """
-    ВАЖНО:
-    - Если тесты или внешние скрипты передали sqlalchemy.url
-      через Alembic Config (cfg.set_main_option),
-      используем его.
-    - Иначе fallback на settings.database_url
-      (обычный режим запуска приложения).
-    """
-    return config.get_main_option("sqlalchemy.url") or settings.database_url
+def get_database_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return url
 
 
 def run_migrations_offline() -> None:
-    """
-    Offline-режим (alembic revision, alembic upgrade --sql).
-    """
-    url = _get_sqlalchemy_url()
-
+    url = get_database_url()
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -49,24 +39,11 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """
-    Online-режим (alembic upgrade).
-    engine_from_config ОБЯЗАН читать sqlalchemy.url из Alembic Config,
-    чтобы cfg.set_main_option("sqlalchemy.url", ...) из pytest работал.
-    """
-    section = config.get_section(config.config_ini_section) or {}
+    url = get_database_url()
 
-    # Страховка: если sqlalchemy.url не положили в config,
-    # подставляем его сами
-    section.setdefault("sqlalchemy.url", _get_sqlalchemy_url())
+    engine = create_engine(url, poolclass=pool.NullPool)
 
-    connectable = engine_from_config(
-        section,
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    with connectable.connect() as connection:
+    with engine.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -76,8 +53,6 @@ def run_migrations_online() -> None:
         with context.begin_transaction():
             context.run_migrations()
 
-
-# Точка входа Alembic
 if context.is_offline_mode():
     run_migrations_offline()
 else:
