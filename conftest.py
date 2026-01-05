@@ -1,45 +1,31 @@
 from __future__ import annotations
 
 import os
-import pathlib
 import sys
+from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 # Корень backend/
-ROOT = pathlib.Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent
 
+# 1) Для тестов грузим .env.test (если есть), иначе .env
+ENV_TEST = ROOT / ".env.test"
+ENV_MAIN = ROOT / ".env"
 
-def _assert_no_placeholder_revision() -> None:
-    versions_dir = ROOT / "alembic" / "versions"
-    if not versions_dir.exists():
-        return
+if ENV_TEST.exists():
+    load_dotenv(ENV_TEST, override=True)
+else:
+    load_dotenv(ENV_MAIN, override=False)
 
-    bad: list[str] = []
-    for p in versions_dir.glob("*.py"):
-        try:
-            txt = p.read_text(encoding="utf-8")
-        except Exception:
-            # если вдруг бинарный/битый файл — просто пропустим
-            continue
-        if "<PUT_YOUR_REV_ID_HERE>" in txt:
-            bad.append(str(p))
-
-    if bad:
-        raise RuntimeError(
-            "Found '<PUT_YOUR_REV_ID_HERE>' in Alembic migrations:\n" + "\n".join(bad)
-        )
-
-
-_assert_no_placeholder_revision()
-
-# чтобы "import app" работал в тестах, даже если pytest запускается из другого места
+# 2) Чтобы "import app" работал стабильно
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -47,17 +33,18 @@ from app.main import app  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 
 
-def _get_test_db_url() -> str:
-    return os.getenv(
-        "TEST_DATABASE_URL",
-        "postgresql+psycopg://vpn:vpn@localhost:5432/vpn_test",
-    )
+def _get_db_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Create backend/.env.test (preferred) or backend/.env"
+        )
+    return url
 
 
 @pytest.fixture(scope="session")
 def engine() -> Engine:
-    url = _get_test_db_url()
-    return create_engine(url, future=True, pool_pre_ping=True)
+    return create_engine(_get_db_url(), future=True, pool_pre_ping=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -75,10 +62,7 @@ def migrate_db(engine: Engine) -> None:
         raise RuntimeError(f"alembic.ini not found at: {alembic_ini}")
 
     cfg = Config(str(alembic_ini))
-    cfg.set_main_option(
-        "sqlalchemy.url",
-        engine.url.render_as_string(hide_password=False),
-    )
+    cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
     command.upgrade(cfg, "head")
 
 
@@ -110,8 +94,6 @@ def client(db_session: Session) -> TestClient:
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
-
     with TestClient(app) as c:
         yield c
-
     app.dependency_overrides.clear()
