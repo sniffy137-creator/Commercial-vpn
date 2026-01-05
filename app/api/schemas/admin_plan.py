@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AdminPlanBase(BaseModel):
@@ -21,7 +21,6 @@ class AdminPlanCreate(AdminPlanBase):
 
 
 class AdminPlanUpdate(BaseModel):
-    # все поля опциональные
     name: str | None = Field(default=None, min_length=1, max_length=120)
 
     price_cents: int | None = Field(default=None, ge=0)
@@ -36,5 +35,4 @@ class AdminPlanUpdate(BaseModel):
 class AdminPlanOut(AdminPlanBase):
     id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AdminSubscriptionOut(BaseModel):
@@ -11,8 +12,7 @@ class AdminSubscriptionOut(BaseModel):
     plan_name: str | None = None
     expires_at: datetime | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AdminUserWithSubscriptionOut(BaseModel):
@@ -21,8 +21,7 @@ class AdminUserWithSubscriptionOut(BaseModel):
     role: str
     subscription: AdminSubscriptionOut | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AdminGrantSubscriptionIn(BaseModel):
