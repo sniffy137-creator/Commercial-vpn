@@ -1,26 +1,74 @@
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+ROOT = Path(__file__).resolve().parents[2]  # backend/
+
+
+def _running_pytest() -> bool:
+    return bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+def _select_env_file() -> str | None:
+    env = (os.getenv("ENV") or os.getenv("APP_ENV") or "").strip().lower()
+
+    env_test = ROOT / ".env.test"
+    env_main = ROOT / ".env"
+
+    if env == "test":
+        return str(env_test) if env_test.exists() else None
+
+    if _running_pytest() and env_test.exists():
+        return str(env_test)
+
+    return str(env_main) if env_main.exists() else None
+
+
 class Settings(BaseSettings):
-    # Важно:
-    # - case_sensitive=False: DATABASE_URL и database_url нормально мапятся
-    # - extra="ignore": чтобы любые лишние переменные (например TEST_DATABASE_URL) не валили приложение
-    # - env_file=".env": файл как fallback, но приоритет у переменных окружения
     model_config = SettingsConfigDict(
-        env_file=".env",
         env_ignore_empty=True,
-        case_sensitive=False,
         extra="ignore",
+        case_sensitive=False,
     )
 
-    app_name: str = "Commercial VPN API"
-    env: str = "dev"
+    app_name: str = Field(
+        default="Commercial VPN API",
+        validation_alias=AliasChoices("APP_NAME", "app_name"),
+    )
+    env: str = Field(
+        default="dev",
+        validation_alias=AliasChoices("ENV", "APP_ENV", "env"),
+    )
 
-    database_url: str
+    database_url: str = Field(
+        ...,
+        validation_alias=AliasChoices("DATABASE_URL", "database_url"),
+    )
 
-    jwt_secret: str
-    jwt_alg: str = "HS256"
-    access_token_expire_min: int = 60
+    jwt_secret: str = Field(
+        ...,
+        validation_alias=AliasChoices("JWT_SECRET", "jwt_secret"),
+    )
+    jwt_alg: str = Field(
+        default="HS256",
+        validation_alias=AliasChoices("JWT_ALG", "jwt_alg"),
+    )
+    access_token_expire_min: int = Field(
+        default=60,
+        validation_alias=AliasChoices("ACCESS_TOKEN_EXPIRE_MIN", "access_token_expire_min"),
+    )
 
 
-settings = Settings()
+@lru_cache
+def get_settings() -> Settings:
+    env_file = _select_env_file()
+    return Settings(_env_file=env_file, _env_file_encoding="utf-8")
+
+
+settings = get_settings()
